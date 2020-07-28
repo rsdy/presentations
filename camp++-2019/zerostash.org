@@ -1,0 +1,213 @@
+#+Title: Encrypting cloud storage like we mean it
+#+Author: Peter Parkanyi (@rhapsodhy)
+#+EPRESENT_FRAME_LEVEL: 1
+
+* $ whoami
+
+I build security software
+
+
+* What is a cloud
+
+Someone else's computer
+
+* What is cloud storage 
+  
+Storing your camping pics on someone else's computer
+
+* Why do I need this?
+
+Data that only exists once doesn't exist
+
+* Privacy policies
+
+ud be cuter if you smiled more
+
+* But encryp---
+
+"we only store your data on our servers encrypted"
+==
+"you have no idea about your threat model, and we're exploiting this"
+
+* A brief history of cloud storage
+
+  2007:
+For a Linux user, you can already build such a system yourself quite
+trivially by getting an FTP account, mounting it locally with
+curlftpfs, and then using SVN or CVS on the mounted filesystem. From
+Windows or Mac, this FTP account could be accessed through built-in
+software.
+
+  2018:
+Dropbox IPO at $756m
+
+* Threat model has changed
+  
+If your server is online, it may not be yours
+
+* The ecosystem moved
+
+Moxie, 2016
+
+Also, fuck gpg
+
+* We can encrypt!
+  
+Well with a few issues:
+
+ * friction
+ * broken encryption
+ * written in PHP
+ * slooooooooooow
+ * doesn't protect metadata
+
+* A word about metadata
+  
+They literally murder people based on it.
+
+But also...
+
+* Live demo
+  
+* File size analysis
+
+File size is a one-way unique identifier for content
+36 bits of entropy
+1 in 2^18 collisions ~ 250000
+of meaningful content
+  
+* 1:250000
+
+arXiv: 1.500.000 articles
+the pirate bay: scrapable probably
+
+* Engineering a solution
+
+ * needs to be fast
+ * protects all metadata
+ * portable
+ * independent
+ * scalable
+ * straightforward implementation
+
+* Zerostash
+  
+Zero-metadata data stash
+
+ * deduplicated
+ * even size is hidden
+ * work as a file system
+ * sync & wipe data & encryption programs before crossing borders
+ * backup to an external drive
+ * server has no idea about users and their content
+   
+* Zerobox format
+
+4MB blobs
+They can store data or metadata or both
+32 byte random object id
+
+Main metadata file with oid = argon2(pwd)
+
+* Data boxes
+  
+AAD(LZ4(chunk))
+AAD(LZ4(chunk))
+AAD(LZ4(chunk))
+AAD(LZ4(chunk))
+AAD(LZ4(chunk))
+...
+padding random
+
+* Huh?
+  
+Random access mem^W chunks
+Indexed by metadata boxes
+mmap then decrypt
+
+* Metadata boxes
+  
+AAD(
+  CBOR header (512 bytes)
+  ...
+  LZ4-stream(field):
+    64k frame
+    64k frame
+    ...
+
+  pad to 64k multiple
+
+  LZ4-stream(field):
+    64k frame
+    64k frame
+    ...
+)
+padding random
+
+* Header
+
+Fields are dynamic. A box can contain many fields
+Header only tells the offset, you can store whatever you like there.
+
+It kinda sucks to index into an LZ4 frame, so pad to multiples to
+64k and restart the compression stream.
+
+Wasteful but c'est la vie.
+
+* Crypto
+
+ChaCha20-Poly1305
+Argon2
+Blake2
+SeaHash
+
+* Key management
+
+Not my problem (tm)
+
+Symmetric crypto, but composes with in asymmetric
+A fixed key for the entire archive.
+
+Root object:
+  K_1 = Argon2(pwd, 1)
+  K_2 = Argon2(pwd, 2)
+  oid = K_1
+
+Chunks are special:
+ 
+  k = Blake2-hmac(K_2, data)
+  n = lower 8 bytes of oid | size(lz4(data)) (4 bytes)
+  AAD(data, k, n)
+
+* Implementation
+
+WIP
+
+Rust (THIS IS NOT A RUST SONG)
+
+~ 350-400 MB/s on a potato with fast SSD
+
+* Re-cap
+ 
+Can't tell if a user stores data on a server
+Can't tell how much data they store
+Can't tell number of users on a server
+
+Object utilisation varies
+Low latency random access
+
+Deduplicated. Encrypted. 
+Fearlessly concurrent. Lightning fast. Much secure. Data in container. 
+Wowz.
+  
+* Thx & Q&A
+  
+Thx stef
+
+---
+
+me@rhapsodhy.hu
+
+twitter.com/rhapsodhy
+
+github.com/rsdy/zerostash
