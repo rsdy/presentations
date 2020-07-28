@@ -1,0 +1,289 @@
+#+Title: How I stopped worrying and learned to love mmap(2)
+#+Author: Peter Parkanyi (@rhapsodhy)
+#+EPRESENT_FRAME_LEVEL: 1
+
+* $ whoami
+
+I build security software
+I code in Rust
+
+@redsift / *ingraind.org*
+
+   *twitter* | *github*
+@rhapsodhy | @rsdy
+
+* What is a cloud
+
+Someone else's computer
+
+* What is cloud storage 
+  
+Storing your camping pics on someone else's computer
+
+* Privacy policies
+
+Not helpful
+Deliberately vague
+
+* Encryption at rest
+
+Military grade
+Useful if the military literally steals your hard drive
+
+* End-to-end encryption
+  
+If your server is online, it may not be yours
+
+*Solution:*
+Encrypt on the client, so the server doesn't know
+
+* Choose your battles wisely
+
+Performance vs Security
+
+  ( •_•)        (•_• ) 
+  ( ง )ง        ୧( ୧ )
+  /︶\            /︶\
+
+* Steps to performance
+
+loop {
+    1. Minimise latency     \  ~Design~
+    2. Maximise throughput  /
+    3. Profile              \  ~Implementation~
+    4. Tweak                /
+}
+
+* Latency
+
+/time to first bit of response/ (ns/ms)
+
+Get file from a server | HTTP req -> service bizness -> HTTP resp
+Read from a disk       | spinning rust vs SSD
+Syscall overhead       | open()?; loop { read()?; }
+
+* Throughput
+  
+/time to completion/ (GB/s)
+
+ - Encryption
+ - Compression
+ - Network
+ - Disk
+
+* Zerostash
+  
+Zero-metadata data stash
+
+ - deduplicated
+ - even the exact size is hidden
+ - works as a file system
+ - works as a key/value store
+ - server has no idea about users and their content
+   
+* Step 1: Minimise latency
+
+ - 4MB opaque objects
+ - Small enough to sync efficiently
+ - Large enough to bundle small files
+ - Also optimises disk access
+
+* Objects
+  
+#+BEGIN_SRC rust
+pub struct Object<T> {
+    pub id: ObjectId,
+    pub buffer: T,
+    capacity: usize,
+    cursor: usize,
+}
+
+#[derive(Clone)]
+pub struct BlockBuffer(Box<[u8]>);
+#+END_SRC
+
+* Step 2: Choose the right primitives
+  
+Passwords     | Argon2
+Indexing      | Blake2
+Compression   | LZ4
+Encryption    | ChaCha20-Poly1305
+Deduplication | SeaHash
+
+* Free optimisations
+
+~std::sync::mpsc~       -> ~crossbeam-channel~
+~std::thread~           -> ~crossbeam-utils~
+~RwLock<HashMap<K, V>>~ -> ~dashmap~
+
+~blake2b_simd~ is the fastest I measured 
+ - bonus: ~rust-argon2~ also uses this
+
+~lz4~ is just a wrapper for the C library
+~seahash~ for non-cryptographic hashes
+
+* Implementation design
+
+/Good programs copy, fast programs steal/
+
+... or borrow
+
+/Trust the operating system & the compiler/
+
+... within reason
+
+* Big picture
+
+#+BEGIN_SRC rust
+thread::scope(|s| {
+    let file = file.open();
+    let mmap = MmapOptions::new().map(&file).unwrap();
+
+    for (start, hash, data) in FileSplitter::<SeaSplit>::new(&mmap) {
+	let chunkptr = chunkindex
+	    .push(hash, || objectstore.store_chunk(&hash, data))
+	    .unwrap();
+
+	entry.chunks.push((start, chunkptr));
+    }
+    fileindex.push(entry);
+})
+#+END_SRC
+
+* Step 3: Profile
+  
+perf on Linux supports Rust
+Instruments on macOS
+
+[[file:instruments.png]]
+  
+* Step 4: Tweak
+  
+Small things make a huge difference in a hot loop
+
+ - Reduce the number of copies
+ - Slice access generates a boundary check
+ - LTO
+ - Inlining
+ - Reducing code size on the hot path
+ - Threads and pipelining
+ - Using SIMD crypto/hashing libraries
+  
+* read() vs mmap()
+
+io-uring is the new kid on the block
+ ✘ It's linux only
+
+So just use ~memmap~
+ ✔ works everywhere
+ ✔ reduces our syscall-pressure
+ ✔ the OS will page fault and load the missing pieces
+ ✔ get a ~&[u8]~ that can be passed around
+ 
+* Design for mmap()
+  
++-------------------------------------------------------------+
+| +--------------+-------------+-------------------+--------+ |
+| |              |             | &data[start..end] | crypto | |
+| | File         | mmap        |-------------------+--------+ |
+| |              |             | &data[start..end] | crypto | |
+| +--------------+-------------+-------------------+--------+ |
+|                                                             |
+| Thread 1                                                    |
++-------------------------------------------------------------+ 
+
+* Syscall pressure
+
+[[file:instruments-syscall.png]]
+
+* Copy of a copy of a copy
+
+Copying data is expensive
+
+We could just pass around a ~&[u8]~ and use slices inside
+
+Then copy when we must
+
+* Slicing a slice
+
+When you access a slice, Rust generates a boundary check
+ - (Unless you ~assert!()~ on the code path)
+
+Slicing a slice on the hot path will reduce your performance
+
+#+BEGIN_SRC rust
+#[inline]
+fn inner(data: &[u8], size: usize) {
+  let data = data[0..size];
+  ...
+}
+
+fn outer() {
+  let data: &[u8] = get_data();
+  inner(data);
+}
+#+END_SRC
+
+* Cache lines
+
+To get fast code, you want to reduce your hot path size
+~#[inline]~ code to avoid function calls
+
+*Gotchas:* 
+Excessive inlining will increase your instruction size
+ - And ruins your instruction cache
+
+*Pro tip:* the boundary check + panic code is kinda big
+
+* A Tale of Two Threads
+
+Keeping data on the same thread avoids a context switch
+However, you can't predict a page fault
+
+[[file:instruments-threads.png]]
+
+^^ That's what I/O latency looks like
+(And probably cache misses)
+
+* Arc all the things
+  
+Reduces the number of copies, cleans up when done
+  
+#+BEGIN_SRC rust
+pub type ReadObject = Object<ReadBuffer>;
+
+#[derive(Clone)]
+pub struct Directory {
+    target: Arc<PathBuf>,
+    read_lru: Arc<Mutex<LruCache<ObjectId, Arc<ReadObject>>>>,
+}
+#+END_SRC
+
+* Cargo.toml
+
+#+BEGIN_SRC toml
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+#+END_SRC
+
+Around 30% best case speedup
+
+* The elephant in the cloud
+
+I have not tried ~async~ on this project.
+
+My *expectation* is that splitting the pipeline
+          will help increase CPU utilisation
+
+But I've already measured 700-1000 MB/s
+          on lots of small files
+
+* Thx & Q&A
+  
+me@rhapsodhy.hu
+
+twitter.com/rhapsodhy
+
+github.com/rsdy/zerostash
